@@ -377,3 +377,339 @@ save(
 message("Analysis completed.")
 message("Displayed classified genes: ", nrow(anno_ordered))
 message("Functional modules: ", length(unique(anno_ordered$Functional_module)))
+
+############################################################
+## Ribosomal protein abundance heatmap in CPTAC COAD
+## with GO-derived functional module annotation
+############################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+## =========================================================
+## 1. Set working directory and create output folders
+## =========================================================
+
+setwd("/home/xxm_xxm/CJX_workspace/RPs/")
+
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+
+## =========================================================
+## 2. Load CPTAC COAD tumor-normal proteome log2FC matrix
+## =========================================================
+
+exp <- read.table(
+  "Human__CPTAC_COAD__PNNL__Proteome__TMT__03_01_2017__BCM__Gene__Tumor_Normal_log2FC.cct",
+  header = TRUE,
+  row.names = 1,
+  sep = "\t",
+  check.names = FALSE
+)
+
+mat <- as.matrix(exp)
+
+## =========================================================
+## 3. Load NPM1 high-confidence interactors
+## =========================================================
+
+npm1_interactors <- read.csv(
+  "../NPM1-BIOID2/NPM1_high_confidence_interactors.csv",
+  stringsAsFactors = FALSE
+)
+
+gene_list <- unique(npm1_interactors$Gene)
+
+## =========================================================
+## 4. GO enrichment analysis for NPM1 interactors
+## =========================================================
+
+gene_entrez <- clusterProfiler::bitr(
+  gene_list,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+ego_bp <- clusterProfiler::enrichGO(
+  gene          = gene_entrez$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.2,
+  readable      = TRUE
+)
+
+ego_bp_simplified <- clusterProfiler::simplify(
+  ego_bp,
+  cutoff = 0.7,
+  by = "p.adjust",
+  select_fun = min
+)
+
+## Use top GO terms as functional modules
+go_show <- ego_bp_simplified@result %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::slice_head(n = 10)
+
+write.csv(
+  go_show,
+  "results/NPM1_GO_modules_used_for_RP_annotation.csv",
+  row.names = FALSE
+)
+
+## =========================================================
+## 5. Build GO term-gene relationship
+## =========================================================
+
+go_gene_df <- go_show %>%
+  dplyr::select(ID, Description, geneID, p.adjust, Count) %>%
+  tidyr::separate_rows(geneID, sep = "/") %>%
+  dplyr::rename(
+    GO_ID = ID,
+    Functional_module = Description,
+    Gene = geneID
+  )
+
+## If one gene belongs to multiple GO terms,
+## assign it to the most significant GO term
+gene_module <- go_gene_df %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::slice_min(
+    order_by = p.adjust,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Gene, Functional_module)
+
+## =========================================================
+## 6. Load NPM1-interacting ribosomal protein list
+## =========================================================
+
+rp_df <- read.csv(
+  "../NPM1-BIOID2/NPM1_ribosomal_proteins_subset.csv",
+  stringsAsFactors = FALSE
+)
+
+rp_genes <- unique(rp_df$Gene)
+
+## Add GO-derived functional module annotation to RPs
+rp_anno <- rp_df %>%
+  dplyr::distinct(Gene, .keep_all = TRUE) %>%
+  dplyr::left_join(gene_module, by = "Gene") %>%
+  dplyr::mutate(
+    Functional_module = ifelse(
+      is.na(Functional_module),
+      "Other RP-associated module",
+      Functional_module
+    )
+  )
+
+## =========================================================
+## 7. Extract RPs from CPTAC matrix
+## =========================================================
+
+matched_genes <- intersect(rp_genes, rownames(mat))
+missing_genes <- setdiff(rp_genes, rownames(mat))
+
+message("Matched RPs in CPTAC: ", length(matched_genes))
+message("Missing RPs in CPTAC: ", length(missing_genes))
+
+if (length(missing_genes) > 0) {
+  message("Missing genes:")
+  print(missing_genes)
+}
+
+data <- mat[matched_genes, , drop = FALSE]
+data[is.na(data) | is.nan(data) | is.infinite(data)] <- 0
+
+## =========================================================
+## 8. Build RP annotation dataframe
+## =========================================================
+
+rp_anno_plot <- rp_anno %>%
+  dplyr::filter(Gene %in% matched_genes) %>%
+  dplyr::select(Gene, Functional_module)
+
+rp_anno_plot <- rp_anno_plot[
+  match(rownames(data), rp_anno_plot$Gene),
+]
+
+rp_anno_plot$CPTAC_mean_log2FC <- rowMeans(data, na.rm = TRUE)
+
+## =========================================================
+## 9. Summarize RP abundance by functional module
+## =========================================================
+
+rp_module_summary <- rp_anno_plot %>%
+  dplyr::group_by(Functional_module) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_log2FC = mean(CPTAC_mean_log2FC, na.rm = TRUE),
+    median_log2FC = median(CPTAC_mean_log2FC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(mean_log2FC))
+
+write.csv(
+  rp_module_summary,
+  "results/NPM1_interacting_RP_GO_module_CPTAC_summary.csv",
+  row.names = FALSE
+)
+
+print(rp_module_summary)
+
+## =========================================================
+## 10. Order RPs by CPTAC mean log2FC
+## =========================================================
+
+row_order <- rp_anno_plot %>%
+  dplyr::arrange(desc(CPTAC_mean_log2FC)) %>%
+  dplyr::pull(Gene)
+
+data_ordered <- data[row_order, , drop = FALSE]
+
+rp_anno_ordered <- rp_anno_plot[
+  match(row_order, rp_anno_plot$Gene),
+]
+
+## Order module annotation according to ranked appearance
+module_order <- unique(rp_anno_ordered$Functional_module)
+
+rp_anno_ordered$Functional_module <- factor(
+  rp_anno_ordered$Functional_module,
+  levels = module_order
+)
+
+mean_ordered <- rp_anno_ordered$CPTAC_mean_log2FC
+
+## =========================================================
+## 11. Limit extreme values for visualization
+## =========================================================
+
+data_plot <- data_ordered
+data_plot[data_plot > 2] <- 2
+data_plot[data_plot < -2] <- -2
+
+## =========================================================
+## 12. Define colors
+## =========================================================
+
+col_fun <- circlize::colorRamp2(
+  c(-2, -1, 0, 1, 2),
+  c("#3B4CC0", "#AFCBFF", "white", "#FDBE85", "#B40426")
+)
+
+module_levels <- levels(rp_anno_ordered$Functional_module)
+
+module_palette <- c(
+  "#E64B35FF",
+  "#4DBBD5FF",
+  "#00A087FF",
+  "#3C5488FF",
+  "#F39B7FFF",
+  "#8491B4FF",
+  "#91D1C2FF",
+  "#7E6148FF",
+  "#B09C85FF",
+  "#6A3D9AFF"
+)
+
+module_cols <- module_palette[seq_along(module_levels)]
+names(module_cols) <- module_levels
+
+## =========================================================
+## 13. Row annotations
+## =========================================================
+
+left_anno <- rowAnnotation(
+  `GO module` = rp_anno_ordered$Functional_module,
+  col = list(`GO module` = module_cols),
+  show_annotation_name = TRUE,
+  annotation_name_gp = gpar(fontsize = 8)
+)
+
+right_anno <- rowAnnotation(
+  `Mean\nlog2FC` = anno_barplot(
+    mean_ordered,
+    gp = gpar(fill = "#B40426", col = NA),
+    border = FALSE,
+    width = unit(1.5, "cm")
+  ),
+  annotation_name_gp = gpar(fontsize = 8)
+)
+
+## =========================================================
+## 14. Draw heatmap
+## =========================================================
+
+ht <- Heatmap(
+  data_plot,
+  name = "Tumor/Normal\nlog2FC",
+  col = col_fun,
+  
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  
+  show_column_names = FALSE,
+  row_names_side = "right",
+  row_names_gp = gpar(fontsize = 6),
+  
+  width = unit(3, "cm"),
+  height = unit(6, "cm")
+)
+
+ht_final <- left_anno + ht + right_anno
+
+pdf(
+  "figures/Fig_NPM1_interacting_RPs_CPTAC_heatmap_GO_module_annotation.pdf",
+  width = 8.5,
+  height = 10,
+  useDingbats = FALSE
+)
+
+draw(ht_final)
+
+dev.off()
+
+png(
+  "figures/Fig_NPM1_interacting_RPs_CPTAC_heatmap_GO_module_annotation.png",
+  width = 2550,
+  height = 3000,
+  res = 300
+)
+
+draw(ht_final)
+
+dev.off()
+
+## =========================================================
+## 15. Export ordered RP gene list
+## =========================================================
+
+rp_gene_list <- rp_anno_ordered %>%
+  dplyr::select(
+    Functional_module,
+    Gene,
+    CPTAC_mean_log2FC
+  )
+
+write.csv(
+  rp_gene_list,
+  "results/NPM1_interacting_RPs_CPTAC_ordered_gene_list_with_GO_module.csv",
+  row.names = FALSE
+)
+
+message("RP heatmap analysis completed.")
+message("Displayed RPs: ", nrow(rp_gene_list))
+
+
